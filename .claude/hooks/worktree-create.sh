@@ -9,7 +9,7 @@
 #   <pattern>   — copy matching files into the worktree
 #   !<pattern>  — exclude matching files (cancels a prior include rule)
 #
-# Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, worktree_name, ...)
+# Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, name, ...)
 # Output: absolute path of the created worktree on stdout
 
 set -euo pipefail
@@ -19,7 +19,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 input=$(cat)
 cwd=$(printf '%s' "$input" | jq -r '.cwd')
-worktree_name_arg=$(printf '%s' "$input" | jq -r '.worktree_name // empty')
+worktree_name=$(printf '%s' "$input" | jq -r '.name // empty')
+
+if [[ -z "$worktree_name" ]]; then
+    echo "worktree-create: 'name' field is required in hook input" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Find git root
@@ -30,23 +35,41 @@ if ! git_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null); then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Default behavior: create a git worktree with a new branch based on HEAD
+# 3. Resolve worktree path and branch name
 # ---------------------------------------------------------------------------
-# Use the name provided by Claude Code; fall back to a random hex suffix
-if [[ -n "$worktree_name_arg" ]]; then
-    worktree_name="$worktree_name_arg"
-else
-    rand_hex=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    worktree_name="worktree-${rand_hex}"
-fi
+# Path:   .claude/worktrees/<name>      (no prefix)
+# Branch: worktree-<name>
+worktree_branch="worktree-${worktree_name}"
 worktrees_dir="${git_root}/.claude/worktrees"
 worktree_path="${worktrees_dir}/${worktree_name}"
 
 mkdir -p "$worktrees_dir"
-git -C "$git_root" worktree add -b "$worktree_name" "$worktree_path" HEAD >&2
 
 # ---------------------------------------------------------------------------
-# 4. Process .worktreeinclude files (gitignore-style traversal)
+# 4. Create (or reuse) the worktree — four-case logic
+# ---------------------------------------------------------------------------
+if [[ -d "$worktree_path" ]]; then
+    if git -C "$worktree_path" rev-parse --git-dir &>/dev/null; then
+        # Path already is a git worktree — reuse as-is, skip setup
+        printf '%s\n' "$worktree_path"
+        exit 0
+    else
+        echo "worktree-create: '$worktree_path' exists but is not a git worktree" >&2
+        exit 1
+    fi
+fi
+
+# Path doesn't exist — check branch
+if git -C "$git_root" show-ref --verify --quiet "refs/heads/$worktree_branch" 2>/dev/null; then
+    echo "worktree-create: branch '$worktree_branch' already exists; delete it first or choose a different name" >&2
+    exit 1
+fi
+
+# Neither path nor branch exists — create fresh branch from HEAD
+git -C "$git_root" worktree add -b "$worktree_branch" "$worktree_path" HEAD >&2
+
+# ---------------------------------------------------------------------------
+# 5. Process .worktreeinclude files (gitignore-style traversal)
 # ---------------------------------------------------------------------------
 # Files that are gitignored by standard rules
 mapfile -d '' standard_ignored < <(
@@ -89,7 +112,7 @@ for rel_path in "${standard_ignored[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# 5. Initialize submodules selected by .worktreeinclude
+# 6. Initialize submodules selected by .worktreeinclude
 # ---------------------------------------------------------------------------
 mapfile -t _sm_paths < <(
     git -C "$git_root" submodule status 2>/dev/null | awk '{print $2}' || true
@@ -98,7 +121,7 @@ mapfile -t _sm_paths < <(
 if [[ ${#_sm_paths[@]} -gt 0 ]]; then
     # Build a temp git repo mapping .worktreeinclude → .gitignore so that
     # git check-ignore --no-index can match submodule paths using the same
-    # gitignore engine (and nested-file traversal) as section 4.
+    # gitignore engine (and nested-file traversal) as section 5.
     _tmp=$(mktemp -d)
     git init -q "$_tmp"
 
@@ -115,28 +138,31 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
     for _sm in "${_sm_paths[@]}"; do
         [[ -z "$_sm" ]] && continue
         if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
+            # Included submodule: check out at the exact commit the parent repo expects
+            _sm_commit=$(git -C "$git_root" rev-parse "HEAD:${_sm}")
             _git_common_dir=$(git -C "$git_root" rev-parse --git-common-dir)
             _module_dir="${_git_common_dir}/modules/${_sm}"
             if [[ -d "$_module_dir" ]]; then
                 # Reuse existing module cache — no remote URL needed
                 git -C "$_module_dir" worktree add \
-                    --detach "$worktree_path/$_sm" HEAD >&2 || \
+                    --detach "$worktree_path/$_sm" "$_sm_commit" >&2 || \
                     echo "worktree-create: warning: submodule worktree add failed for $_sm" >&2
             else
                 git -c protocol.file.allow=always -C "$worktree_path" \
                     submodule update --init -- "$_sm" >&2 || \
                     echo "worktree-create: warning: submodule init failed for $_sm" >&2
             fi
-        else
-            # Excluded submodule: remove the empty placeholder dir git created
-            rmdir "$worktree_path/$_sm" 2>/dev/null || true
         fi
+        # Excluded submodule: leave the empty placeholder directory that
+        # 'git worktree add' created. An empty dir at a gitlink path (no .git
+        # file, not registered in .git/config) is invisible to 'git status' —
+        # it does NOT appear as deleted.
     done
 
     rm -rf "$_tmp"
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Output the worktree path (required by Claude Code)
+# 7. Output the worktree path (required by Claude Code)
 # ---------------------------------------------------------------------------
 printf '%s\n' "$worktree_path"

@@ -9,7 +9,7 @@ HOOK="$REPO/.claude/hooks/worktree-create.sh"
 cleanup() {
     if [[ -n "${worktree:-}" && -d "${worktree:-}" ]]; then
         local branch
-        branch=$(basename "$worktree")
+        branch="worktree-$(basename "$worktree")"
         git -C "$REPO" worktree remove --force "$worktree" 2>/dev/null || true
         git -C "$REPO" branch -D "$branch" 2>/dev/null || true
     fi
@@ -17,7 +17,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Running hook..."
-worktree=$(echo '{"cwd":"'"$REPO"'","session_id":"test","hook_event_name":"WorktreeCreate"}' | bash "$HOOK")
+worktree=$(echo '{"cwd":"'"$REPO"'","session_id":"test","hook_event_name":"WorktreeCreate","name":"test-wt"}' | bash "$HOOK")
 echo "Worktree: $worktree"
 echo ""
 
@@ -90,6 +90,21 @@ echo "SUBMODULE HANDLING (.worktreeinclude controls submodule checkout)"
 echo "─────────────────────────────────────────────────────────────────────────"
 check "included submodule checked out"     "submodules/alpha/README.md"  yes ""
 check "excluded submodule not checked out" "submodules/beta/README.md"   no  ""
+
+echo ""
+echo "─────────────────────────────────────────────────────────────────────────"
+echo "WORKTREE GIT STATUS (must be clean — no deleted submodule entries)"
+echo "─────────────────────────────────────────────────────────────────────────"
+status_output=$(git -C "$worktree" status --porcelain 2>&1)
+if [[ -z "$status_output" ]]; then
+    printf "PASS  %-60s  %s\n" "[git status clean]" "worktree has no uncommitted changes"
+    PASS=$((PASS+1))
+else
+    printf "FAIL  %-60s\n" "[git status clean]"
+    echo "  git status --porcelain output:"
+    echo "$status_output" | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+fi
 
 echo ""
 echo "─────────────────────────────────────────────────────────────────────────"
