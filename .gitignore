@@ -1,0 +1,48 @@
+# ── Claude Code ──────────────────────────────────────────────────────────────
+.claude/settings.local.json
+.claude/test-upstreams/
+.claude/worktrees/
+
+# ── Dev container ────────────────────────────────────────────────────────────
+.devcontainer/
+
+# ── Env / secrets ────────────────────────────────────────────────────────────
+secrets/
+*.env
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+build/
+# anchored: only /dist at repo root, not src/dist or pkg/dist
+/dist
+
+# ── Deep double-star cache ────────────────────────────────────────────────────
+deep/**/cache
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+# negation: un-ignore a specific log so it stays tracked
+!logs/important.log
+
+# ── Python cache (anywhere in the tree) ──────────────────────────────────────
+**/__pycache__/
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Nested git repos (test fixtures) ────────────────────────────────────────
+libs/
+
+# ── Temp dirs (case-insensitive via char class) ───────────────────────────────
+[Tt]emp/
+
+# ── Backup files — char class [aA] ───────────────────────────────────────────
+*.b[aA]k
+
+# ── Single-char-prefix txt files ─────────────────────────────────────────────
+?.txt
+
+# ── Dated log files (char class digits) ──────────────────────────────────────
+logs/[0-9][0-9][0-9][0-9]-[0-9][0-9].log
+
+# ── Cache files (for nested .worktreeinclude test) ────────────────────────────
+*.cache

@@ -1,6 +1,6 @@
 [submodule "submodules/alpha"]
 	path = submodules/alpha
-	url = /workspaces/foo/.claude/test-upstreams/alpha.git
+	url = /workspaces/worktree-create-hook/.claude/test-upstreams/alpha.git
 [submodule "submodules/beta"]
 	path = submodules/beta
-	url = /workspaces/foo/.claude/test-upstreams/beta.git
+	url = /workspaces/worktree-create-hook/.claude/test-upstreams/beta.git

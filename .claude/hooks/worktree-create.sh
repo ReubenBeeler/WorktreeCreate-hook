@@ -38,52 +38,87 @@ worktrees_dir="${git_root}/.claude/worktrees"
 worktree_path="${worktrees_dir}/${worktree_name}"
 
 mkdir -p "$worktrees_dir"
-git -C "$git_root" worktree add -b "$worktree_name" "$worktree_path" HEAD
+git -C "$git_root" worktree add -b "$worktree_name" "$worktree_path" HEAD >&2
 
 # ---------------------------------------------------------------------------
-# 4. Process .worktreeinclude (if present)
+# 4. Process .worktreeinclude files (gitignore-style traversal)
 # ---------------------------------------------------------------------------
-include_file="${git_root}/.worktreeinclude"
+# Files that are gitignored by standard rules
+mapfile -d '' standard_ignored < <(
+    git -C "$git_root" ls-files --others --ignored --exclude-standard -z 2>/dev/null || true
+)
 
-if [[ -f "$include_file" ]]; then
-    # Files that are gitignored by standard rules
-    mapfile -d '' standard_ignored < <(
-        git -C "$git_root" ls-files --others --ignored --exclude-standard -z 2>/dev/null || true
-    )
+# Files matched by .worktreeinclude patterns using git's own gitignore engine,
+# traversing every directory (mirrors how .gitignore works):
+#   --exclude-per-directory=.worktreeinclude  looks for .worktreeinclude in each
+#   directory and applies its rules relative to that directory — identical to
+#   how git handles .gitignore files.
+# Semantics align perfectly:
+#   pattern  → git "ignores" it → we include it in the worktree
+#   !pattern → git un-ignores it → we exclude it from the worktree
+# No standard excludes are applied, so only .worktreeinclude rules govern the set.
+mapfile -d '' include_matched < <(
+    git -C "$git_root" ls-files --others --ignored \
+        --exclude-per-directory=.worktreeinclude -z 2>/dev/null || true
+)
 
-    # Files matched by .worktreeinclude patterns (using git's own gitignore engine).
-    # Semantics align perfectly:
-    #   pattern  → git "ignores" it → we include it in the worktree
-    #   !pattern → git un-ignores it → we exclude it from the worktree
-    mapfile -d '' include_matched < <(
-        git -C "$git_root" \
-            -c "core.excludesFile=${include_file}" \
-            ls-files --others --ignored --no-exclude-standard -z 2>/dev/null || true
-    )
+# Build a lookup set of include_matched paths using an associative array
+declare -A in_include
+for f in "${include_matched[@]}"; do
+    [[ -n "$f" ]] && in_include["$f"]=1
+done
 
-    # Build a lookup set of include_matched paths using an associative array
-    declare -A in_include
-    for f in "${include_matched[@]}"; do
-        [[ -n "$f" ]] && in_include["$f"]=1
-    done
+# Copy files that appear in both sets (gitignored AND matched by .worktreeinclude)
+for rel_path in "${standard_ignored[@]}"; do
+    [[ -z "$rel_path" ]] && continue
+    [[ -z "${in_include[$rel_path]+_}" ]] && continue
 
-    # Copy files that appear in both sets (gitignored AND matched by .worktreeinclude)
-    for rel_path in "${standard_ignored[@]}"; do
-        [[ -z "$rel_path" ]] && continue
-        [[ -z "${in_include[$rel_path]+_}" ]] && continue
+    src="${git_root}/${rel_path}"
+    dst="${worktree_path}/${rel_path}"
+    mkdir -p "$(dirname "$dst")"
+    if [[ -f "$src" ]]; then
+        cp -p "$src" "$dst"
+    elif [[ -d "$src" ]]; then
+        cp -rp "$src" "$dst"
+    fi
+done
 
-        src="${git_root}/${rel_path}"
-        dst="${worktree_path}/${rel_path}"
-        mkdir -p "$(dirname "$dst")"
-        if [[ -f "$src" ]]; then
-            cp -p "$src" "$dst"
-        elif [[ -d "$src" ]]; then
-            cp -rp "$src" "$dst"
+# ---------------------------------------------------------------------------
+# 5. Initialize submodules selected by .worktreeinclude
+# ---------------------------------------------------------------------------
+mapfile -t _sm_paths < <(
+    git -C "$git_root" submodule status 2>/dev/null | awk '{print $2}' || true
+)
+
+if [[ ${#_sm_paths[@]} -gt 0 ]]; then
+    # Build a temp git repo mapping .worktreeinclude → .gitignore so that
+    # git check-ignore --no-index can match submodule paths using the same
+    # gitignore engine (and nested-file traversal) as section 4.
+    _tmp=$(mktemp -d)
+    git init -q "$_tmp"
+
+    while IFS= read -r -d '' _wti; do
+        _rel="${_wti#${git_root}/}"
+        _dir=$(dirname "$_rel")
+        mkdir -p "$_tmp/$_dir"
+        cp "$_wti" "$_tmp/$_dir/.gitignore"
+    done < <(find "$git_root" -name '.worktreeinclude' \
+                  -not -path "${git_root}/.git/*" \
+                  -not -path "${git_root}/.claude/worktrees/*" \
+                  -print0 2>/dev/null)
+
+    for _sm in "${_sm_paths[@]}"; do
+        [[ -z "$_sm" ]] && continue
+        if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
+            git -c protocol.file.allow=always -C "$worktree_path" \
+                submodule update --init -- "$_sm" >&2 || true
         fi
     done
+
+    rm -rf "$_tmp"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Output the worktree path (required by Claude Code)
+# 6. Output the worktree path (required by Claude Code)
 # ---------------------------------------------------------------------------
 printf '%s\n' "$worktree_path"

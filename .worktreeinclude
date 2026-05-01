@@ -1,0 +1,45 @@
+# ── Env / secrets ────────────────────────────────────────────────────────────
+# Use file patterns (not dir pattern) so negation can work.
+# "secrets/" would seal the dir and make !negation impossible per git docs.
+secrets/.env*
+!secrets/.env.production
+
+# ── Build artifacts ───────────────────────────────────────────────────────────
+# Negated char class [!c] excludes anything starting with 'c' (i.e. cache/).
+# This also doubles as a [!...] syntax test.
+build/[!c]*
+
+# ── Dist (double-star) ────────────────────────────────────────────────────────
+dist/**
+
+# ── Deep double-star cache ────────────────────────────────────────────────────
+deep/**/cache
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+# Dated log files — redundant with *.log but exercises [0-9] char-class patterns
+logs/[0-9][0-9][0-9][0-9]-[0-9][0-9].log
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+**/__pycache__/**
+
+# ── Temp dirs ────────────────────────────────────────────────────────────────
+[Tt]emp/**
+
+# ── Backup files (char class [aA]) ───────────────────────────────────────────
+*.b[aA]k
+
+# ── Single-char-prefix txt ───────────────────────────────────────────────────
+?.txt
+
+# ── Submodule isolation test ─────────────────────────────────────────────────
+# Even with an explicit pattern, files inside a nested git repo are invisible
+# to the parent's `git ls-files --others --ignored --exclude-standard`
+# because git never recurses into directories containing a .git.
+libs/vendor/**
+
+# node_modules intentionally absent — should NOT be copied to worktree
+
+# ── Submodules ───────────────────────────────────────────────────────────────
+# Include the "alpha" submodule; "beta" is intentionally absent (excluded)
+submodules/alpha
