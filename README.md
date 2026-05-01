@@ -1,5 +1,7 @@
 # WorktreeCreate Hook with `.worktreeinclude`
 
+[![CI](https://github.com/ReubenBeeler/WorktreeCreate-hook/actions/workflows/ci.yaml/badge.svg)](https://github.com/ReubenBeeler/WorktreeCreate-hook/actions/workflows/ci.yaml)
+
 A Claude Code `WorktreeCreate` hook that selectively copies gitignored files into new worktrees using `.worktreeinclude` pattern files.
 
 ## How it works

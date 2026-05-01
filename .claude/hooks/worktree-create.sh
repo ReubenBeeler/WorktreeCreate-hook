@@ -110,8 +110,20 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
     for _sm in "${_sm_paths[@]}"; do
         [[ -z "$_sm" ]] && continue
         if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
-            git -c protocol.file.allow=always -C "$worktree_path" \
-                submodule update --init -- "$_sm" >&2 || true
+            _module_dir="$git_root/.git/modules/$_sm"
+            if [[ -d "$_module_dir" ]]; then
+                # Reuse existing module cache — no remote URL needed
+                git -C "$_module_dir" worktree add \
+                    --detach "$worktree_path/$_sm" HEAD >&2 || \
+                    echo "worktree-create: warning: submodule worktree add failed for $_sm" >&2
+            else
+                git -c protocol.file.allow=always -C "$worktree_path" \
+                    submodule update --init -- "$_sm" >&2 || \
+                    echo "worktree-create: warning: submodule init failed for $_sm" >&2
+            fi
+        else
+            # Excluded submodule: remove the empty placeholder dir git created
+            rmdir "$worktree_path/$_sm" 2>/dev/null || true
         fi
     done
 

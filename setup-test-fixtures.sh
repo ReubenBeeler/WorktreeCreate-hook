@@ -68,21 +68,18 @@ for name in alpha beta; do
     fi
 done
 
-# Fix submodule URLs to point to actual repo location
-git config -f .gitmodules submodule.submodules/alpha.url "$upstreams/alpha.git"
-git config -f .gitmodules submodule.submodules/beta.url "$upstreams/beta.git"
-
-# Fully deinit submodules (clears .git/modules/* with stale remote URLs)
+# Fully deinit submodules (clears .git/modules/* with stale cached URLs)
 git submodule deinit --all --force 2>/dev/null || true
 rm -rf .git/modules/submodules 2>/dev/null || true
 
-# Set URLs in .git/config and initialize submodules
+# Set URLs in .git/config and initialize submodules.
+# .gitmodules holds a portable placeholder; .git/config overrides it at runtime.
 git config submodule.submodules/alpha.url "$upstreams/alpha.git"
 git config submodule.submodules/beta.url "$upstreams/beta.git"
 git -c protocol.file.allow=always submodule update --init --remote
 
 # Update recorded submodule refs so worktrees (created from HEAD) see the correct hashes
-git add submodules/alpha submodules/beta .gitmodules
+git add submodules/alpha submodules/beta
 if ! git diff --cached --quiet; then
     git commit -m "Update submodule refs for current test upstreams"
 fi
