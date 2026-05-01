@@ -9,7 +9,7 @@
 #   <pattern>   — copy matching files into the worktree
 #   !<pattern>  — exclude matching files (cancels a prior include rule)
 #
-# Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, ...)
+# Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, worktree_name, ...)
 # Output: absolute path of the created worktree on stdout
 
 set -euo pipefail
@@ -19,6 +19,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 input=$(cat)
 cwd=$(printf '%s' "$input" | jq -r '.cwd')
+worktree_name_arg=$(printf '%s' "$input" | jq -r '.worktree_name // empty')
 
 # ---------------------------------------------------------------------------
 # 2. Find git root
@@ -31,9 +32,13 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Default behavior: create a git worktree with a new branch based on HEAD
 # ---------------------------------------------------------------------------
-# Generate a unique name using /dev/urandom (portable, no python/openssl needed)
-rand_hex=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
-worktree_name="worktree-${rand_hex}"
+# Use the name provided by Claude Code; fall back to a random hex suffix
+if [[ -n "$worktree_name_arg" ]]; then
+    worktree_name="$worktree_name_arg"
+else
+    rand_hex=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    worktree_name="worktree-${rand_hex}"
+fi
 worktrees_dir="${git_root}/.claude/worktrees"
 worktree_path="${worktrees_dir}/${worktree_name}"
 
@@ -110,7 +115,8 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
     for _sm in "${_sm_paths[@]}"; do
         [[ -z "$_sm" ]] && continue
         if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
-            _module_dir="$git_root/.git/modules/$_sm"
+            _git_common_dir=$(git -C "$git_root" rev-parse --git-common-dir)
+            _module_dir="${_git_common_dir}/modules/${_sm}"
             if [[ -d "$_module_dir" ]]; then
                 # Reuse existing module cache — no remote URL needed
                 git -C "$_module_dir" worktree add \
