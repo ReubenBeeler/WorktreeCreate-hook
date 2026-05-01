@@ -103,6 +103,12 @@ for rel_path in "${standard_ignored[@]}"; do
 
     src="${git_root}/${rel_path}"
     dst="${worktree_path}/${rel_path}"
+    # Skip if src is the worktree itself or an ancestor of it (would copy into itself).
+    # Strip trailing slash from src — git ls-files appends '/' to directory entries.
+    src_norm="${src%/}"
+    if [[ "$src_norm" == "$worktree_path" ]] || [[ "$worktree_path" == "${src_norm}/"* ]]; then
+        continue
+    fi
     mkdir -p "$(dirname "$dst")"
     if [[ -f "$src" ]]; then
         cp -p "$src" "$dst"
