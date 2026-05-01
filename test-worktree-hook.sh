@@ -90,6 +90,7 @@ echo "SUBMODULE HANDLING (.worktreeinclude controls submodule checkout)"
 echo "─────────────────────────────────────────────────────────────────────────"
 check "included submodule checked out"     "submodules/alpha/README.md"  yes ""
 check "excluded submodule not checked out" "submodules/beta/README.md"   no  ""
+check "excluded submodule dir exists"     "submodules/beta"              yes ""
 
 echo ""
 echo "─────────────────────────────────────────────────────────────────────────"

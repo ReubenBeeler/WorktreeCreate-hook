@@ -153,10 +153,12 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
                     echo "worktree-create: warning: submodule init failed for $_sm" >&2
             fi
         fi
-        # Excluded submodule: leave the empty placeholder directory that
-        # 'git worktree add' created. An empty dir at a gitlink path (no .git
-        # file, not registered in .git/config) is invisible to 'git status' —
-        # it does NOT appear as deleted.
+        # Excluded submodule: create an empty placeholder directory.
+        # An empty dir at a gitlink path (no .git file, not registered in
+        # .git/config) is invisible to 'git status' — it does NOT appear as deleted.
+        # We always mkdir here because 'git worktree add' does not create
+        # directories for gitlink (submodule) entries.
+        mkdir -p "${worktree_path}/${_sm}"
     done
 
     rm -rf "$_tmp"
