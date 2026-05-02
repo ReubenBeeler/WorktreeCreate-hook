@@ -55,7 +55,7 @@ git -C libs/vendor diff --cached --quiet || \
 upstreams="$REPO/.claude/test-upstreams"
 mkdir -p "$upstreams"
 
-for name in alpha beta; do
+for name in alpha beta gamma; do
     bare="$upstreams/$name.git"
     if [[ ! -d "$bare" ]]; then
         tmp=$(mktemp -d)
@@ -67,6 +67,17 @@ for name in alpha beta; do
         rm -rf "$tmp"
     fi
 done
+
+# Wire gamma as a nested submodule inside alpha (push the change to alpha's bare upstream).
+alpha_tmp=$(mktemp -d)
+git clone "$upstreams/alpha.git" "$alpha_tmp"
+if [[ ! -f "$alpha_tmp/.gitmodules" ]]; then
+    git -C "$alpha_tmp" -c protocol.file.allow=always \
+        submodule add "$upstreams/gamma.git" nested/gamma
+    git -C "$alpha_tmp" commit -m "add nested gamma submodule"
+    git -C "$alpha_tmp" push
+fi
+rm -rf "$alpha_tmp"
 
 # Fully deinit submodules (clears .git/modules/* with stale cached URLs)
 git submodule deinit --all --force 2>/dev/null || true
