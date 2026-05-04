@@ -148,21 +148,43 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
             _sm_commit=$(git -C "$git_root" rev-parse "HEAD:${_sm}")
             _sm_initialized=false
 
-            # Phase A: reuse the local module cache via 'git worktree add'.
+            # Phase A: reuse local git objects via 'git worktree add'.
             # This is the preferred path: it requires no network access and
             # correctly handles commits that exist locally but haven't been
             # pushed to the remote (local-only commits would cause Phase B to
             # fail with "upload-pack: not our ref").
+            #
+            # Two locations are checked for the local git object store:
+            #   1. Standard:   .git/modules/<sm>        (modern git submodule setup)
+            #   2. Old-style:  <sm>/.git (directory)    (embedded git dir, not separated)
             _module_dir="${git_root}/.git/modules/${_sm}"
+            if [[ ! -d "$_module_dir" ]] && [[ -d "${git_root}/${_sm}/.git" ]]; then
+                # Old-style submodule: git objects are stored in the submodule's
+                # own embedded .git/ directory instead of .git/modules/.
+                _module_dir="${git_root}/${_sm}/.git"
+            fi
+
             if [[ -d "$_module_dir" ]]; then
+                git -C "$_module_dir" worktree prune 2>/dev/null || true
                 if git -C "$_module_dir" worktree add \
                        --detach "${worktree_path}/${_sm}" "$_sm_commit" >&2; then
                     _sm_initialized=true
+                elif git -C "$_module_dir" cat-file -e "${_sm_commit}^{commit}" 2>/dev/null; then
+                    # worktree add failed (e.g. locked registration) but the
+                    # commit exists locally — clone directly from the local
+                    # git dir, no network required.
+                    if git clone --local --no-hardlinks \
+                           "$_module_dir" "${worktree_path}/${_sm}" >&2; then
+                        git -C "${worktree_path}/${_sm}" \
+                            checkout --detach "$_sm_commit" >&2 || true
+                        _sm_initialized=true
+                    fi
                 fi
             fi
 
             # Phase B: fallback — use git's submodule machinery (clones from
-            # remote URL).  Only reached when the module cache is absent.
+            # remote URL).  Only reached when Phase A found no usable local
+            # git object store, or when the local clone itself failed.
             # On success, force the exact commit (submodule update checks out
             # remote HEAD, not necessarily the gitlink commit).
             # On failure, deinit to remove the stale URL registration that
@@ -208,6 +230,7 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
                     # Phase C-A: reuse nested module cache
                     _nested_mod="${_sm_common}/modules/${_nested}"
                     if [[ -d "$_nested_mod" ]]; then
+                        git -C "$_nested_mod" worktree prune 2>/dev/null || true
                         if git -C "$_nested_mod" worktree add \
                                --detach "${worktree_path}/${_sm}/${_nested}" \
                                "$_nested_commit" >&2; then
