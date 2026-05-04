@@ -144,32 +144,57 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
     for _sm in "${_sm_paths[@]}"; do
         [[ -z "$_sm" ]] && continue
         if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
-            # Included submodule: initialize using git's own submodule machinery.
-            # 'git submodule update --init' is the officially supported way to
-            # initialize submodules inside git worktrees — it re-uses the
-            # existing module object store under .git/modules/ so no network
-            # access is needed when the cache is already present.
+            # Included submodule: check out the exact commit the parent records.
             _sm_commit=$(git -C "$git_root" rev-parse "HEAD:${_sm}")
             _sm_initialized=false
-            if git -c protocol.file.allow=always -C "$worktree_path" \
-                   submodule update --init -- "$_sm" >&2; then
-                _sm_initialized=true
-            else
-                echo "worktree-create: warning: submodule init failed for $_sm" >&2
+
+            # Phase A: reuse the local module cache via 'git worktree add'.
+            # This is the preferred path: it requires no network access and
+            # correctly handles commits that exist locally but haven't been
+            # pushed to the remote (local-only commits would cause Phase B to
+            # fail with "upload-pack: not our ref").
+            _module_dir="${git_root}/.git/modules/${_sm}"
+            if [[ -d "$_module_dir" ]]; then
+                if git -C "$_module_dir" worktree add \
+                       --detach "${worktree_path}/${_sm}" "$_sm_commit" >&2; then
+                    _sm_initialized=true
+                fi
             fi
-            # Safety net: force the exact commit regardless of what submodule update checked out.
-            if [[ "$_sm_initialized" == true ]]; then
-                git -C "$worktree_path/$_sm" checkout --detach "$_sm_commit" >&2 || \
-                    echo "worktree-create: warning: submodule checkout failed for $_sm" >&2
+
+            # Phase B: fallback — use git's submodule machinery (clones from
+            # remote URL).  Only reached when the module cache is absent.
+            # On success, force the exact commit (submodule update checks out
+            # remote HEAD, not necessarily the gitlink commit).
+            # On failure, deinit to remove the stale URL registration that
+            # 'git submodule init' wrote to .git/config — without this,
+            # git status reports "modified content" for the empty directory.
+            if [[ "$_sm_initialized" == false ]]; then
+                if git -c protocol.file.allow=always -C "$worktree_path" \
+                       submodule update --init -- "$_sm" >&2; then
+                    git -C "$worktree_path/$_sm" checkout --detach "$_sm_commit" >&2 || \
+                        echo "worktree-create: warning: submodule checkout failed for $_sm" >&2
+                    _sm_initialized=true
+                else
+                    git -C "$worktree_path" submodule deinit -f -- "$_sm" \
+                        >/dev/null 2>&1 || true
+                    echo "worktree-create: warning: submodule init failed for $_sm" >&2
+                fi
             fi
+
             # Nested submodules: initialize individually with deinit-on-failure.
-            # 'git submodule init' registers a submodule URL in git/config
+            # Same Phase A → Phase B logic as above.
+            # 'git submodule init' registers a nested submodule URL in git/config
             # BEFORE attempting the clone.  If the clone fails (e.g. SSH key
-            # not available), the registration remains but no checkout exists —
+            # not available), that registration remains but no checkout exists —
             # 'git status' then reports "modified content" for the parent.
-            # Calling 'git submodule deinit -f' removes that stale registration
+            # Calling 'git submodule deinit -f' removes the stale registration
             # so the empty placeholder dir is invisible to git status.
             if [[ "$_sm_initialized" == true ]] && [[ -e "$worktree_path/$_sm/.gitmodules" ]]; then
+                _sm_common=$(git -C "$worktree_path/$_sm" rev-parse \
+                    --git-common-dir 2>/dev/null || true)
+                # --git-common-dir may return a relative path; make it absolute.
+                [[ -n "$_sm_common" && "$_sm_common" != /* ]] && \
+                    _sm_common="${worktree_path}/${_sm}/${_sm_common}"
                 mapfile -t _nested_paths < <(
                     git config --file "$worktree_path/$_sm/.gitmodules" \
                         --get-regexp 'submodule\..*\.path' 2>/dev/null | awk '{print $2}' || true
@@ -179,13 +204,28 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
                     _nested_commit=$(git -C "$worktree_path/$_sm" rev-parse \
                         "HEAD:${_nested}" 2>/dev/null || true)
                     [[ -z "$_nested_commit" ]] && continue
-                    if ! git -c protocol.file.allow=always -C "$worktree_path/$_sm" \
-                           submodule update --init -- "$_nested" >&2; then
-                        git -C "$worktree_path/$_sm" submodule deinit -f -- "$_nested" \
-                            >/dev/null 2>&1 || true
-                        echo "worktree-create: warning: nested submodule init failed for ${_sm}/${_nested}" >&2
+                    _nested_initialized=false
+                    # Phase C-A: reuse nested module cache
+                    _nested_mod="${_sm_common}/modules/${_nested}"
+                    if [[ -d "$_nested_mod" ]]; then
+                        if git -C "$_nested_mod" worktree add \
+                               --detach "${worktree_path}/${_sm}/${_nested}" \
+                               "$_nested_commit" >&2; then
+                            _nested_initialized=true
+                        fi
                     fi
-                    mkdir -p "$worktree_path/$_sm/$_nested"
+                    # Phase C-B: fallback clone with deinit-on-failure
+                    if [[ "$_nested_initialized" == false ]]; then
+                        if git -c protocol.file.allow=always -C "$worktree_path/$_sm" \
+                               submodule update --init -- "$_nested" >&2; then
+                            _nested_initialized=true
+                        else
+                            git -C "$worktree_path/$_sm" submodule deinit -f -- "$_nested" \
+                                >/dev/null 2>&1 || true
+                            echo "worktree-create: warning: nested submodule init failed for ${_sm}/${_nested}" >&2
+                        fi
+                    fi
+                    mkdir -p "${worktree_path}/${_sm}/${_nested}"
                 done
             fi
         fi
