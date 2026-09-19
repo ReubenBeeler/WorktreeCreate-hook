@@ -35,6 +35,7 @@ echo "notes backup caps"                      > notes.bAk
 echo "one char prefix"                        > a.txt
 echo "two char prefix"                        > bc.txt
 echo "this file is un-ignored by .gitignore"  > logs/important.log
+echo "untracked, un-ignored by !logs/keep.log"  > logs/keep.log
 
 # ── Nested .worktreeinclude ──────────────────────────────────────────────────
 echo "*.cache" > src/.worktreeinclude

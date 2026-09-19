@@ -73,6 +73,7 @@ check "!secrets/.env.production negation"      "secrets/.env.production"     no 
 check "build/[!c]* excludes cache/"            "build/cache/data.json"       no  ""
 check "node_modules/ not in .worktreeinclude"  "node_modules/lodash/get.js"  no  ""
 check "tracked: logs/important.log"             "logs/important.log"          yes ""
+check "!logs/keep.log in .gitignore (untracked)" "logs/keep.log"               no  ""
 check "tracked: bc.txt"                         "bc.txt"                      yes ""
 check "submodule isolation: nested .git"       "libs/vendor/secret.key"      no  ""
 

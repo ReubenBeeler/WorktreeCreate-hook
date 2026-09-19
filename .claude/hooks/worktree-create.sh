@@ -11,8 +11,28 @@
 #
 # Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, name, ...)
 # Output: absolute path of the created worktree on stdout
+#
+# Requirements (cross-platform: Linux + macOS):
+#   bash  — 3.2+ (the version macOS ships as /bin/bash); no bash 4 features used
+#   git   — 2.26+ (worktree, ls-files -z; check-ignore -z --stdin only reports
+#           truly-ignored paths — not bare pattern matches — from 2.26 on)
+#   jq    — NOT bundled with macOS before 15; install with `brew install jq`
+#           (this script exits with an explicit error if it is missing)
+# Only POSIX/BSD-compatible invocations of cp/find/awk/mktemp are used, so no
+# GNU coreutils installation is needed.
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 0. Dependency checks — fail loudly rather than mid-way through setup
+# ---------------------------------------------------------------------------
+for _dep in git jq; do
+    if ! command -v "$_dep" >/dev/null 2>&1; then
+        echo "worktree-create: required command '$_dep' not found in PATH." >&2
+        echo "worktree-create: install it first (macOS: brew install $_dep)." >&2
+        exit 1
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 1. Read input
@@ -71,35 +91,25 @@ git -C "$git_root" worktree add -b "$worktree_branch" "$worktree_path" HEAD >&2
 # ---------------------------------------------------------------------------
 # 5. Process .worktreeinclude files (gitignore-style traversal)
 # ---------------------------------------------------------------------------
-# Files that are gitignored by standard rules
-mapfile -d '' standard_ignored < <(
-    git -C "$git_root" ls-files --others --ignored --exclude-standard -z 2>/dev/null || true
-)
+# The set to copy is the intersection of:
+#   a) files matched by .worktreeinclude patterns, using git's own gitignore
+#      engine over every directory (mirrors how .gitignore works):
+#        --exclude-per-directory=.worktreeinclude  looks for .worktreeinclude in
+#        each directory and applies its rules relative to that directory.
+#      Semantics align perfectly:
+#        pattern  -> git "ignores" it -> we include it in the worktree
+#        !pattern -> git un-ignores it -> we exclude it from the worktree
+#      No standard excludes are applied, so only .worktreeinclude rules govern.
+#   b) files that are gitignored by the standard rules, which `git check-ignore`
+#      decides for each path piped to it.
+# Streaming a) into b) computes the intersection with git itself — NUL-safe and
+# free of bash 4 constructs (mapfile / associative arrays), which macOS's
+# bash 3.2 does not provide.
 
-# Files matched by .worktreeinclude patterns using git's own gitignore engine,
-# traversing every directory (mirrors how .gitignore works):
-#   --exclude-per-directory=.worktreeinclude  looks for .worktreeinclude in each
-#   directory and applies its rules relative to that directory — identical to
-#   how git handles .gitignore files.
-# Semantics align perfectly:
-#   pattern  → git "ignores" it → we include it in the worktree
-#   !pattern → git un-ignores it → we exclude it from the worktree
-# No standard excludes are applied, so only .worktreeinclude rules govern the set.
-mapfile -d '' include_matched < <(
-    git -C "$git_root" ls-files --others --ignored \
-        --exclude-per-directory=.worktreeinclude -z 2>/dev/null || true
-)
-
-# Build a lookup set of include_matched paths using an associative array
-declare -A in_include
-for f in "${include_matched[@]}"; do
-    [[ -n "$f" ]] && in_include["$f"]=1
-done
-
-# Copy files that appear in both sets (gitignored AND matched by .worktreeinclude)
-for rel_path in "${standard_ignored[@]}"; do
+# `git check-ignore` exits 1 when it reports nothing; the trailing `|| true`
+# keeps that from tripping `set -o pipefail`.
+while IFS= read -r -d '' rel_path; do
     [[ -z "$rel_path" ]] && continue
-    [[ -z "${in_include[$rel_path]+_}" ]] && continue
 
     src="${git_root}/${rel_path}"
     dst="${worktree_path}/${rel_path}"
@@ -113,14 +123,23 @@ for rel_path in "${standard_ignored[@]}"; do
     if [[ -f "$src" ]]; then
         cp -p "$src" "$dst"
     elif [[ -d "$src" ]]; then
-        cp -rp "$src" "$dst"
+        cp -Rp "$src" "$dst"
     fi
-done
+done < <(
+    git -C "$git_root" ls-files --others --ignored \
+        --exclude-per-directory=.worktreeinclude -z 2>/dev/null \
+        | git -C "$git_root" check-ignore -z --stdin 2>/dev/null || true
+)
 
 # ---------------------------------------------------------------------------
 # 6. Initialize submodules selected by .worktreeinclude
 # ---------------------------------------------------------------------------
-mapfile -t _sm_paths < <(
+# Collected into an array (rather than looped over directly) so the loop body's
+# git commands cannot consume the reader's stdin.
+_sm_paths=()
+while IFS= read -r _line; do
+    [[ -n "$_line" ]] && _sm_paths+=("$_line")
+done < <(
     git -C "$git_root" submodule status 2>/dev/null | awk '{print $2}' || true
 )
 
@@ -141,7 +160,7 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
                   -not -path "${git_root}/.claude/worktrees/*" \
                   -print0 2>/dev/null)
 
-    for _sm in "${_sm_paths[@]}"; do
+    for _sm in ${_sm_paths[@]+"${_sm_paths[@]}"}; do
         [[ -z "$_sm" ]] && continue
         if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
             # Included submodule: check out the exact commit the parent records.
@@ -217,11 +236,14 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
                 # --git-common-dir may return a relative path; make it absolute.
                 [[ -n "$_sm_common" && "$_sm_common" != /* ]] && \
                     _sm_common="${worktree_path}/${_sm}/${_sm_common}"
-                mapfile -t _nested_paths < <(
+                _nested_paths=()
+                while IFS= read -r _line; do
+                    [[ -n "$_line" ]] && _nested_paths+=("$_line")
+                done < <(
                     git config --file "$worktree_path/$_sm/.gitmodules" \
                         --get-regexp 'submodule\..*\.path' 2>/dev/null | awk '{print $2}' || true
                 )
-                for _nested in "${_nested_paths[@]}"; do
+                for _nested in ${_nested_paths[@]+"${_nested_paths[@]}"}; do
                     [[ -z "$_nested" ]] && continue
                     _nested_commit=$(git -C "$worktree_path/$_sm" rev-parse \
                         "HEAD:${_nested}" 2>/dev/null || true)

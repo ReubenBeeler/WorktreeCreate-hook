@@ -22,6 +22,9 @@ deep/**/cache
 *.log
 # negation: un-ignore a specific log so it stays tracked
 !logs/important.log
+# negation of an UNTRACKED file: matches *.log in .worktreeinclude but must not
+# be copied, since it is not actually gitignored (guards check-ignore semantics)
+!logs/keep.log
 
 # ── Python cache (anywhere in the tree) ──────────────────────────────────────
 **/__pycache__/
