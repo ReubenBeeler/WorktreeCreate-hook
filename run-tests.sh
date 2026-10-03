@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Runs every test suite; exits non-zero if any failed.
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "=== Setting up test fixtures ==="
-bash "$SCRIPT_DIR/setup-test-fixtures.sh"
+SH="${BASH:-bash}"
+failed=()
+
+suite() { # name script
+    echo ""
+    echo "=== $1 ==="
+    "$SH" "$SCRIPT_DIR/$2" || failed+=("$1")
+}
+
+suite "Setting up test fixtures" setup-test-fixtures.sh
+suite "WorktreeCreate hook tests" test-worktree-hook.sh
+suite "Branch selection tests" test-branch-selection.sh
+suite "WorktreeRemove hook tests" test-worktree-remove-hook.sh
+suite "Session title hook tests" test-worktree-session-title.sh
+
 echo ""
-rc=0
-echo "=== Running worktree hook tests ==="
-bash "$SCRIPT_DIR/test-worktree-hook.sh" || rc=1
-echo ""
-echo "=== Running branch selection tests ==="
-bash "$SCRIPT_DIR/test-branch-selection.sh" || rc=1
-exit $rc
+if [[ ${#failed[@]} -eq 0 ]]; then
+    echo "ALL SUITES PASSED"
+else
+    printf 'FAILED: %s\n' "${failed[@]}"
+    exit 1
+fi

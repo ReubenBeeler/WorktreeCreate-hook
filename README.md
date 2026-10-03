@@ -23,10 +23,21 @@ Before cases 3 and 4 the hook fetches each remote without prompting, capped at 1
 
 Limitations: fetch does not prune, so a branch deleted upstream may still be offered; single-branch or custom-refspec clones never get `refs/remotes/<remote>/<name>` and fall through to case 4.
 
+## Removing worktrees
+
+Two more hooks make removal safe:
+
+- **`worktree-session-title.sh`** (SessionStart + UserPromptSubmit) titles every session running in `.claude/worktrees/<name>` after the worktree, e.g. `feature/auth` (slashes kept). A titled session always gets Claude Code's Keep/Remove prompt on exit, so a clean worktree is never removed without asking. It never overwrites an existing title (`--name`, `/rename`). Side effect: worktree sessions show the worktree name instead of an AI-generated title; this includes sessions you start manually inside `.claude/worktrees/<name>`.
+- **`worktree-remove.sh`** (WorktreeRemove) removes the worktree only if nothing would be lost; otherwise it keeps it and Claude Code reports the worktree as kept. Kept when the worktree or any initialized submodule (recursively) has modified, staged or untracked files, a merge/rebase/etc. in progress, or commits no surviving repo can reach (a detached HEAD, or submodule commits whose repo is deleted with the worktree); also when it is locked or contains other worktrees. Gitignored files don't count. Branches are always kept.
+
+Clean worktrees can still be removed without the prompt when the session has no custom title: the title hook failed or timed out (e.g. `jq` missing), you exited before SessionStart hooks finished, Claude entered the worktree with EnterWorktree and the session ended before your next prompt, agent-team teammate sessions (which ignore hook titles), or a rare title collision. Also unprompted: a subagent with `isolation: "worktree"` finishing, deleting a background session, and Claude choosing to remove the worktree via `ExitWorktree`. `claude -p --worktree` never cleans up. In every case the remove hook still keeps anything dirty.
+
+> **Warning:** deleting a background session a second time (agent view Ctrl+X twice) or `claude rm --force-remove-worktree` bypasses the hook; untracked files are lost.
+
 ## Running tests
 
 ```bash
 bash run-tests.sh
 ```
 
-This sets up all test fixtures (gitignored files, submodule upstreams, nested repos) and runs both suites: `test-worktree-hook.sh` (file copying, submodules) and `test-branch-selection.sh` (branch selection, fetch bounds, name validation; offline sandbox). Works on a fresh clone — no manual setup needed.
+This sets up all test fixtures (gitignored files, submodule upstreams, nested repos) and runs every suite: the create hook against this repo (file copying, submodules), branch selection (fetch bounds, name validation; offline sandbox), and the remove and session-title hooks against throwaway sandbox repos. Works on a fresh clone — no manual setup needed.
