@@ -3,7 +3,8 @@
 #
 # Replicates the default git worktree creation behavior and adds support
 # for a .worktreeinclude file (gitignore syntax) that copies selected
-# gitignored files into the new worktree.
+# gitignored files from the current worktree into the new one. The new
+# worktree's branch supplies the .gitignore and .worktreeinclude rules.
 #
 # .worktreeinclude semantics (only applies to gitignored files):
 #   <pattern>   — copy matching files into the worktree
@@ -11,6 +12,11 @@
 #
 # Input:  JSON on stdin (fields: cwd, session_id, hook_event_name, name, ...)
 # Output: absolute path of the created worktree on stdout
+#
+# Path:   .claude/worktrees/<name>
+# Branch: <name>. A missing branch that exists on a remote is never guessed:
+#         the hook prints ready-to-run commands and exits 1. Remotes are
+#         fetched first, prompt-free and capped at FETCH_TIMEOUT seconds.
 #
 # Requirements (cross-platform: Linux + macOS):
 #   bash  — 3.2+ (the version macOS ships as /bin/bash); no bash 4 features used
@@ -55,61 +61,280 @@ if ! git_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null); then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Resolve worktree path and branch name
+# 3. Validate name; resolve worktree path and branch name
 # ---------------------------------------------------------------------------
-# Path:   .claude/worktrees/<name>      (no prefix)
-# Branch: worktree-<name>
-worktree_branch="worktree-${worktree_name}"
+# Path:   .claude/worktrees/<name>
+# Branch: <name>
+# check-ref-format rejects '-x', 'HEAD', '..', leading '/', leading-dot parts;
+# output differing from input means an '@{-N}' expansion.
+if ! _checked_name=$(git -C "$git_root" check-ref-format --branch "$worktree_name" 2>/dev/null) \
+   || [[ "$_checked_name" != "$worktree_name" ]]; then
+    echo "worktree-create: '$worktree_name' is not a valid branch name" >&2
+    exit 1
+fi
+
+FETCH_TIMEOUT=10
+worktree_branch="$worktree_name"
 worktrees_dir="${git_root}/.claude/worktrees"
 worktree_path="${worktrees_dir}/${worktree_name}"
 
 mkdir -p "$worktrees_dir"
 
 # ---------------------------------------------------------------------------
-# 4. Create (or reuse) the worktree — four-case logic
+# 4. Create (or reuse) the worktree
 # ---------------------------------------------------------------------------
-if [[ -d "$worktree_path" ]]; then
-    if git -C "$worktree_path" rev-parse --git-dir &>/dev/null; then
-        # Path already is a git worktree — reuse as-is, skip setup
-        printf '%s\n' "$worktree_path"
-        exit 0
+# In order:
+#   prune stale registrations, read registrations, refuse nesting;
+#   case 1: path exists          -> reuse if registered, else exit 1
+#           path registered but missing (locked or unprunable) -> exit 1
+#   case 2: local branch exists  -> exit 1 if checked out elsewhere, else add
+#   case 3: remote branch exists -> fetch, print commands to choose, exit 1
+#   case 4: no branch anywhere   -> new branch from HEAD
+# Limitations: fetch has no --prune, so a branch deleted upstream may still be
+# offered; single-branch/custom-refspec clones never get
+# refs/remotes/<remote>/<name> and fall through to case 4.
+
+# Wraps values outside [A-Za-z0-9._/@+-] in single quotes for copy-paste.
+_q() {
+    local LC_ALL=C
+    case "$1" in
+        ''|*[!A-Za-z0-9._/@+-]*)
+            printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *)  printf '%s' "$1" ;;
+    esac
+}
+
+# Prints every descendant pid of $1.
+_descendants() {
+    local _c
+    for _c in $(pgrep -P "$1" 2>/dev/null || true); do
+        printf '%s\n' "$_c"
+        _descendants "$_c"
+    done
+}
+
+git -C "$git_root" worktree prune >/dev/null 2>&1 || true
+
+_wt_paths=()
+_wt_heads=()
+_wt_branches=()
+_wt_locked=()
+_porcelain=$(git -C "$git_root" worktree list --porcelain)
+while IFS= read -r _line; do
+    case "$_line" in
+        "worktree "*)
+            _wt_paths+=("${_line#worktree }")
+            _wt_heads+=("")
+            _wt_branches+=("")
+            _wt_locked+=(false) ;;
+        "HEAD "*)        _wt_heads[${#_wt_paths[@]}-1]="${_line#HEAD }" ;;
+        "branch "*)      _wt_branches[${#_wt_paths[@]}-1]="${_line#branch }" ;;
+        locked|"locked "*) _wt_locked[${#_wt_paths[@]}-1]=true ;;
+    esac
+done <<< "$_porcelain"
+
+_rest="${worktree_name%/*}"
+while [[ "$_rest" != "$worktree_name" && -n "$_rest" ]]; do
+    for _i in ${_wt_paths[@]+"${!_wt_paths[@]}"}; do
+        if [[ "${_wt_paths[_i]}" == "${worktrees_dir}/${_rest}" ]]; then
+            echo "worktree-create: '$worktree_name' would be nested inside worktree '${_wt_paths[_i]}'" >&2
+            exit 1
+        fi
+    done
+    [[ "$_rest" == */* ]] || break
+    _rest="${_rest%/*}"
+done
+
+# Case 1: path exists
+if [[ -e "$worktree_path" || -L "$worktree_path" ]]; then
+    _phys=""
+    [[ -d "$worktree_path" ]] && _phys=$(cd -P "$worktree_path" 2>/dev/null && pwd -P || true)
+    if [[ -n "$_phys" ]]; then
+        for _i in ${_wt_paths[@]+"${!_wt_paths[@]}"}; do
+            _reg=$(cd -P "${_wt_paths[_i]}" 2>/dev/null && pwd -P || true)
+            [[ -n "$_reg" && "$_reg" == "$_phys" ]] || continue
+            if [[ -n "${_wt_branches[_i]}" ]]; then
+                _on="${_wt_branches[_i]#refs/heads/}"
+            else
+                _on="detached HEAD at $(git -C "$git_root" rev-parse --short "${_wt_heads[_i]}")"
+            fi
+            echo "worktree-create: Reusing worktree $worktree_name on branch $_on" >&2
+            printf '%s\n' "$worktree_path"
+            exit 0
+        done
+    fi
+    echo "worktree-create: '$worktree_path' exists but is not a git worktree" >&2
+    exit 1
+fi
+
+# Path registered but missing
+for _i in ${_wt_paths[@]+"${!_wt_paths[@]}"}; do
+    [[ "${_wt_paths[_i]}" == "$worktree_path" ]] || continue
+    if [[ "${_wt_locked[_i]}" == true ]]; then
+        echo "worktree-create: '$worktree_path' is still registered as a worktree (locked) but its directory is missing; run: git -C $(_q "$git_root") worktree unlock $(_q "$worktree_path") && git -C $(_q "$git_root") worktree prune, then retry" >&2
     else
-        echo "worktree-create: '$worktree_path' exists but is not a git worktree" >&2
+        echo "worktree-create: '$worktree_path' is still registered as a worktree but its directory is missing; run: git -C $(_q "$git_root") worktree prune, then retry; if the registration remains, run git -C $(_q "$git_root") worktree unlock $(_q "$worktree_path") first" >&2
+    fi
+    exit 1
+done
+
+# Case 2: local branch exists
+if git -C "$git_root" show-ref --verify --quiet "refs/heads/$worktree_branch" 2>/dev/null; then
+    for _i in ${_wt_paths[@]+"${!_wt_paths[@]}"}; do
+        [[ "${_wt_branches[_i]}" == "refs/heads/$worktree_branch" ]] || continue
+        _lk=""
+        [[ "${_wt_locked[_i]}" == true ]] && _lk=" (locked)"
+        echo "worktree-create: branch '$worktree_branch' is already checked out in worktree '${_wt_paths[_i]}'$_lk" >&2
+        echo "A branch can be checked out in only one worktree; switch or remove that worktree, or use a different name, then retry." >&2
+        exit 1
+    done
+    git -C "$git_root" worktree add "$worktree_path" "$worktree_branch" >&2
+else
+    # Case 3: bounded, prompt-free fetch, then look for remote branches
+    _remotes=()
+    while IFS= read -r _r; do
+        [[ -n "$_r" ]] && _remotes+=("$_r")
+    done < <(git -C "$git_root" remote 2>/dev/null | LC_ALL=C sort || true)
+
+    _fetch_failed=()
+    if [[ ${#_remotes[@]} -gt 0 ]]; then
+        _ssh_cmd=""
+        if [[ -z "${GIT_SSH_COMMAND:-}" && -z "${GIT_SSH:-}" ]] \
+           && ! git -C "$git_root" config core.sshCommand >/dev/null 2>&1; then
+            _ssh_cmd="ssh -o BatchMode=yes -o ConnectTimeout=5"
+        fi
+        _false=$(type -P false || true)
+        _deadline=$((SECONDS + FETCH_TIMEOUT))
+        {
+            for _r in "${_remotes[@]}"; do
+                if (( SECONDS >= _deadline )); then
+                    _fetch_failed+=("$_r")
+                    continue
+                fi
+                (
+                    export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= GCM_INTERACTIVE=never
+                    export SSH_ASKPASS_REQUIRE=force SSH_ASKPASS="$_false"
+                    [[ -n "$_ssh_cmd" ]] && export GIT_SSH_COMMAND="$_ssh_cmd"
+                    exec git -C "$git_root" -c gc.auto=0 -c maintenance.auto=false \
+                        fetch --quiet --no-recurse-submodules "$_r"
+                ) </dev/null >/dev/null 2>&1 &
+                _pid=$!
+                while kill -0 "$_pid" 2>/dev/null && (( SECONDS < _deadline )); do
+                    sleep 0.2
+                done
+                if kill -0 "$_pid" 2>/dev/null; then
+                    _tree="$_pid $(_descendants "$_pid" | tr '\n' ' ')"
+                    kill -TERM $_tree 2>/dev/null || true
+                    kill -CONT $_tree 2>/dev/null || true
+                    sleep 1
+                    kill -KILL $_tree 2>/dev/null || true
+                    wait "$_pid" 2>/dev/null || true
+                    _fetch_failed+=("$_r")
+                elif ! wait "$_pid" 2>/dev/null; then
+                    _fetch_failed+=("$_r")
+                fi
+            done
+        } 2>/dev/null
+    fi
+    _fetch_msg=""
+    if [[ ${#_fetch_failed[@]} -gt 0 ]]; then
+        _list=$(printf '%s, ' "${_fetch_failed[@]}")
+        _fetch_msg="worktree-create: fetch failed or timed out for: ${_list%, }; using existing remote-tracking refs"
+    fi
+
+    _matches=()
+    for _r in ${_remotes[@]+"${_remotes[@]}"}; do
+        if git -C "$git_root" show-ref --verify --quiet "refs/remotes/$_r/$worktree_branch" 2>/dev/null; then
+            _matches+=("$_r")
+        fi
+    done
+
+    if [[ ${#_matches[@]} -gt 0 ]]; then
+        _list=$(printf '%s, ' "${_matches[@]}")
+        _head_desc=$(git -C "$git_root" symbolic-ref --short -q HEAD 2>/dev/null || echo detached)
+        _head_short=$(git -C "$git_root" rev-parse --short HEAD 2>/dev/null || echo unborn)
+        {
+            echo "worktree-create: branch '$worktree_branch' does not exist locally but exists on remote(s): ${_list%, }."
+            echo "Run ONE of these to choose what '$worktree_branch' starts from, then retry:"
+            echo "  git -C $(_q "$git_root") branch $(_q "$worktree_branch") HEAD  # current HEAD ($_head_desc @ $_head_short)"
+            for _r in "${_matches[@]}"; do
+                echo "  git -C $(_q "$git_root") branch --track $(_q "$worktree_branch") $(_q "$_r/$worktree_branch")"
+            done
+            [[ -z "$_fetch_msg" ]] || echo "$_fetch_msg"
+        } >&2
+        exit 1
+    fi
+    [[ -z "$_fetch_msg" ]] || echo "$_fetch_msg" >&2
+
+    # Case 4: new branch from HEAD; explicit -b/HEAD disables remote guessing
+    _head_sha=$(git -C "$git_root" rev-parse -q --verify HEAD 2>/dev/null || true)
+    if ! git -C "$git_root" worktree add -b "$worktree_branch" "$worktree_path" HEAD >&2; then
+        _new_sha=$(git -C "$git_root" rev-parse -q --verify "refs/heads/$worktree_branch" 2>/dev/null || true)
+        _porcelain=$(git -C "$git_root" worktree list --porcelain 2>/dev/null || true)
+        if [[ -n "$_head_sha" && "$_new_sha" == "$_head_sha" ]] \
+           && ! printf '%s\n' "$_porcelain" | grep -qxF "branch refs/heads/$worktree_branch"; then
+            git -C "$git_root" branch -D "$worktree_branch" >/dev/null 2>&1 || true
+        fi
+        echo "worktree-create: could not create worktree '$worktree_path'" >&2
         exit 1
     fi
 fi
 
-# Path doesn't exist — check branch
-if git -C "$git_root" show-ref --verify --quiet "refs/heads/$worktree_branch" 2>/dev/null; then
-    echo "worktree-create: branch '$worktree_branch' already exists; delete it first or choose a different name" >&2
-    exit 1
-fi
-
-# Neither path nor branch exists — create fresh branch from HEAD
-git -C "$git_root" worktree add -b "$worktree_branch" "$worktree_path" HEAD >&2
-
 # ---------------------------------------------------------------------------
-# 5. Process .worktreeinclude files (gitignore-style traversal)
+# 5. Copy files selected by the branch's .worktreeinclude
 # ---------------------------------------------------------------------------
-# The set to copy is the intersection of:
-#   a) files matched by .worktreeinclude patterns, using git's own gitignore
-#      engine over every directory (mirrors how .gitignore works):
-#        --exclude-per-directory=.worktreeinclude  looks for .worktreeinclude in
-#        each directory and applies its rules relative to that directory.
-#      Semantics align perfectly:
-#        pattern  -> git "ignores" it -> we include it in the worktree
-#        !pattern -> git un-ignores it -> we exclude it from the worktree
-#      No standard excludes are applied, so only .worktreeinclude rules govern.
-#   b) files that are gitignored by the standard rules, which `git check-ignore`
-#      decides for each path piped to it.
-# Streaming a) into b) computes the intersection with git itself — NUL-safe and
-# free of bash 4 constructs (mapfile / associative arrays), which macOS's
-# bash 3.2 does not provide.
+# Rules come from the new worktree (the checked-out branch); files come from
+# the current worktree. A file is copied when it is all of:
+#   a) untracked in the current worktree;
+#   b) matched by the branch's .worktreeinclude files;
+#   c) ignored by the branch's .gitignore files (plus info/exclude and
+#      core.excludesFile).
+# b) and c) each mirror the branch's rule files into a temp repo as .gitignore
+# files, so `check-ignore --no-index` applies them with gitignore semantics
+# (pattern -> match, !pattern -> unmatch, nested files scope to their
+# directory). Streaming a) through b) and c) computes the intersection with git
+# itself — NUL-safe and free of bash 4 constructs, which macOS's bash 3.2 lacks.
+_inc_repo=$(mktemp -d)
+_ign_repo=$(mktemp -d)
+trap 'rm -rf "$_inc_repo" "$_ign_repo"' EXIT
+git init -q "$_inc_repo"
+git init -q "$_ign_repo"
+_has_wti=false
+while IFS= read -r -d '' _f; do
+    _rule_src="${worktree_path}/${_f}"
+    [[ -f "$_rule_src" && ! -L "$_rule_src" ]] || continue
+    case "$_f" in
+        .worktreeinclude|*/.worktreeinclude) _repo="$_inc_repo"; _has_wti=true ;;
+        .gitignore|*/.gitignore)             _repo="$_ign_repo" ;;
+        *) continue ;;
+    esac
+    _dir=$(dirname "$_f")
+    mkdir -p "$_repo/$_dir"
+    cp "$_rule_src" "$_repo/$_dir/.gitignore"
+done < <(git -C "$worktree_path" ls-files -z 2>/dev/null || true)
+
+_common=$(git -C "$git_root" rev-parse --git-common-dir)
+[[ "$_common" == /* ]] || _common="${git_root}/${_common}"
+[[ -f "$_common/info/exclude" ]] && cp "$_common/info/exclude" "$_ign_repo/.git/info/exclude"
+_ign_git=(git -C "$_ign_repo")
+_xf=$(git -C "$worktree_path" config --path core.excludesFile 2>/dev/null || true)
+[[ -n "$_xf" ]] && _ign_git+=(-c "core.excludesFile=$_xf")
+
+# check-ignore matches a trailing '/' loosely ('d/**' matches 'd/'), so
+# directory entries (nested repos) are re-tested bare against real temp dirs.
+_dir_selected() {
+    mkdir -p "$_inc_repo/$1" "$_ign_repo/$1"
+    git -C "$_inc_repo" check-ignore --no-index -q -- "$1" 2>/dev/null \
+        && "${_ign_git[@]}" check-ignore --no-index -q -- "$1" 2>/dev/null
+}
 
 # `git check-ignore` exits 1 when it reports nothing; the trailing `|| true`
 # keeps that from tripping `set -o pipefail`.
 while IFS= read -r -d '' rel_path; do
     [[ -z "$rel_path" ]] && continue
+    if [[ "$rel_path" == */ ]]; then
+        _dir_selected "${rel_path%/}" || continue
+    fi
 
     src="${git_root}/${rel_path}"
     dst="${worktree_path}/${rel_path}"
@@ -119,52 +344,67 @@ while IFS= read -r -d '' rel_path; do
     if [[ "$src_norm" == "$worktree_path" ]] || [[ "$worktree_path" == "${src_norm}/"* ]]; then
         continue
     fi
-    mkdir -p "$(dirname "$dst")"
-    if [[ -f "$src" ]]; then
-        cp -p "$src" "$dst"
-    elif [[ -d "$src" ]]; then
-        cp -Rp "$src" "$dst"
+    # Never write through a symlink or over existing content.
+    [[ -e "${dst%/}" || -L "${dst%/}" ]] && continue
+    _parent_rel=$(dirname "${rel_path%/}")
+    _cur="$worktree_path"
+    _safe=true
+    if [[ "$_parent_rel" != "." ]]; then
+        _rest="$_parent_rel/"
+        while [[ -n "$_rest" ]]; do
+            _cur="${_cur}/${_rest%%/*}"
+            _rest="${_rest#*/}"
+            if [[ -L "$_cur" ]] || { [[ -e "$_cur" ]] && [[ ! -d "$_cur" ]]; }; then
+                _safe=false
+                break
+            fi
+        done
     fi
+    [[ "$_safe" == true ]] || continue
+    _copied=true
+    if ! mkdir -p "$(dirname "$dst")"; then
+        _copied=false
+    elif [[ -f "$src" ]]; then
+        cp -p "$src" "$dst" || _copied=false
+    elif [[ -d "$src" ]]; then
+        cp -Rp "$src" "$dst" || _copied=false
+    fi
+    [[ "$_copied" == true ]] || echo "worktree-create: warning: could not copy $rel_path" >&2
 done < <(
-    git -C "$git_root" ls-files --others --ignored \
-        --exclude-per-directory=.worktreeinclude -z 2>/dev/null \
-        | git -C "$git_root" check-ignore -z --stdin 2>/dev/null || true
+    [[ "$_has_wti" == true ]] || exit 0
+    git -C "$git_root" ls-files --others -z 2>/dev/null \
+        | git -C "$_inc_repo" check-ignore --no-index -z --stdin 2>/dev/null \
+        | "${_ign_git[@]}" check-ignore --no-index -z --stdin 2>/dev/null || true
 )
 
 # ---------------------------------------------------------------------------
-# 6. Initialize submodules selected by .worktreeinclude
+# 6. Initialize submodules selected by the branch's .worktreeinclude
 # ---------------------------------------------------------------------------
-# Collected into an array (rather than looped over directly) so the loop body's
-# git commands cannot consume the reader's stdin.
+# Matched against section 5's .worktreeinclude temp repo.
+# Submodule paths and commits come from the worktree's index (gitlinks, mode
+# 160000), so they match the checked-out branch. Collected into arrays (rather
+# than looped over directly) so the loop body's git commands cannot consume the
+# reader's stdin.
 _sm_paths=()
-while IFS= read -r _line; do
-    [[ -n "$_line" ]] && _sm_paths+=("$_line")
-done < <(
-    git -C "$git_root" submodule status 2>/dev/null | awk '{print $2}' || true
-)
+_sm_commits=()
+while IFS= read -r -d '' _entry; do
+    case "$_entry" in
+        "160000 "*)
+            _meta="${_entry%%$'\t'*}"
+            _meta="${_meta#160000 }"
+            _sm_commits+=("${_meta%% *}")
+            _sm_paths+=("${_entry#*$'\t'}") ;;
+    esac
+done < <(git -C "$worktree_path" ls-files -s -z 2>/dev/null || true)
 
 if [[ ${#_sm_paths[@]} -gt 0 ]]; then
-    # Build a temp git repo mapping .worktreeinclude → .gitignore so that
-    # git check-ignore --no-index can match submodule paths using the same
-    # gitignore engine (and nested-file traversal) as section 5.
-    _tmp=$(mktemp -d)
-    git init -q "$_tmp"
-
-    while IFS= read -r -d '' _wti; do
-        _rel="${_wti#${git_root}/}"
-        _dir=$(dirname "$_rel")
-        mkdir -p "$_tmp/$_dir"
-        cp "$_wti" "$_tmp/$_dir/.gitignore"
-    done < <(find "$git_root" -name '.worktreeinclude' \
-                  -not -path "${git_root}/.git/*" \
-                  -not -path "${git_root}/.claude/worktrees/*" \
-                  -print0 2>/dev/null)
-
-    for _sm in ${_sm_paths[@]+"${_sm_paths[@]}"}; do
+    for _i in "${!_sm_paths[@]}"; do
+        _sm="${_sm_paths[_i]}"
         [[ -z "$_sm" ]] && continue
-        if git -C "$_tmp" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
-            # Included submodule: check out the exact commit the parent records.
-            _sm_commit=$(git -C "$git_root" rev-parse "HEAD:${_sm}")
+        mkdir -p "$_inc_repo/$_sm"
+        if git -C "$_inc_repo" check-ignore --no-index -q -- "$_sm" 2>/dev/null; then
+            # Included submodule: check out the exact commit the worktree records.
+            _sm_commit="${_sm_commits[_i]}"
             _sm_initialized=false
 
             # Phase A: reuse local git objects via 'git worktree add'.
@@ -281,8 +521,6 @@ if [[ ${#_sm_paths[@]} -gt 0 ]]; then
         # directories for gitlink (submodule) entries.
         mkdir -p "${worktree_path}/${_sm}"
     done
-
-    rm -rf "$_tmp"
 fi
 
 # ---------------------------------------------------------------------------

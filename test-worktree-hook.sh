@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # Verifies that worktree-create.sh correctly copies/skips files per
 # .gitignore + .worktreeinclude intersection logic.
+# The fresh name makes the hook fetch the real origin; offline, it falls back
+# within 10s.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && git rev-parse --show-toplevel)"
 HOOK="$REPO/.claude/hooks/worktree-create.sh"
+name="test-wt-$$-$RANDOM"
+wt_path="$REPO/.claude/worktrees/$name"
+
+if git -C "$REPO" show-ref --verify --quiet "refs/heads/$name" || [[ -e "$wt_path" || -L "$wt_path" ]]; then
+    echo "Aborting: branch or worktree '$name' already exists" >&2
+    exit 1
+fi
 
 cleanup() {
-    if [[ -n "${worktree:-}" && -d "${worktree:-}" ]]; then
-        local branch
-        branch="worktree-$(basename "$worktree")"
-        git -C "$REPO" worktree remove --force "$worktree" 2>/dev/null || true
-        git -C "$REPO" branch -D "$branch" 2>/dev/null || true
-    fi
+    git -C "$REPO" worktree remove --force "$wt_path" 2>/dev/null || true
+    git -C "$REPO" branch -D "$name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 echo "Running hook..."
-worktree=$(echo '{"cwd":"'"$REPO"'","session_id":"test","hook_event_name":"WorktreeCreate","name":"test-wt"}' | bash "$HOOK")
+worktree=$(echo '{"cwd":"'"$REPO"'","session_id":"test","hook_event_name":"WorktreeCreate","name":"'"$name"'"}' | bash "$HOOK")
 echo "Worktree: $worktree"
 echo ""
 
